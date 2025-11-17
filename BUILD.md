@@ -46,10 +46,10 @@ Using CMake:
 
 ```sh
 # Clone the repository
-git clone https://github.com/savoirfairelinux/opendht.git
+git clone https://github.com/QuantumMeme/XORchat.git
 
 # build and install
-cd opendht
+cd XORchat
 mkdir build && cd build
 cmake -DCMAKE_INSTALL_PREFIX=/usr ..
 make -j$(nproc)
@@ -88,7 +88,7 @@ cd vcpkg; .\bootstrap-vcpkg.bat
 
 2. Use CMake preset for vcpkg:
 ```ps1
-cd opendht
+cd XORchat
 cmake --preset=vcpkg_manifest .
 cmake --build .
 ```
