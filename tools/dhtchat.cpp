@@ -28,6 +28,16 @@ extern "C" {
 }
 #include <ctime>
 
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <map>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <utility>
+#include <iostream>
+
 using namespace dht;
 
 static std::mt19937_64 rd {dht::crypto::getSeededRandomEngine<std::mt19937_64>()};
@@ -38,6 +48,63 @@ const std::string printTime(const std::time_t& now) {
     char buf[80];
     strftime(buf, sizeof(buf), "%Y-%m-%d %X", &tstruct);
     return buf;
+}
+
+// creating environment for config file. we'll use this to store nicknames and identities. and whatever settings we want.
+static std::string get_default_config_dir()
+{
+    const char* xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        return std::string(xdg) + "/xorchat";
+    }
+    const char* home = getenv("HOME");
+    if (home && *home) {
+        return std::string(home) + "/.xorchat";
+    }
+    return std::string(".xorchat");
+}
+
+// just making these easier to access
+static bool dir_exists(const std::string& path)
+{
+    try {
+        std::filesystem::create_directories(path);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool file_exists(const std::string& path)
+{
+    return std::filesystem::exists(path);
+}
+
+//if we want more files then it'll be just storing mapped string pairs. i miss dicts :(
+static void save_simple_conf(const std::string& confpath, const std::map<std::string,std::string>& map)
+{
+    std::ofstream of(confpath, std::ios::trunc);
+    for (auto &p : map)
+        of << p.first << "=" << p.second << "\n";
+    of.close();
+}
+
+
+static std::map<std::string,std::string> load_simple_conf(const std::string& confpath)
+{
+    std::map<std::string,std::string> out;
+    std::ifstream ifs(confpath);
+    if (!ifs) return out;
+    std::string line;
+    while (std::getline(ifs, line)) {
+        auto pos = line.find('=');
+        if (pos != std::string::npos) {
+            auto key = line.substr(0, pos);
+            auto val = line.substr(pos+1);
+            out[key] = val;
+        }
+    }
+    return out;
 }
 
 void print_usage() {
@@ -61,6 +128,59 @@ main(int argc, char **argv)
     }
 #endif
 
+    // Checking for configuration files
+    std::string config_dir = get_default_config_dir();
+    std::string ident_dir = config_dir + "/ident";
+    std::string conf_file = config_dir + "/xorchat.conf";
+
+    if (!file_exists(config_dir) || !file_exists(ident_dir)) {
+    // create structure and create initial config
+        if (!dir_exists(ident_dir)) {
+            std::cerr << "Failed to create config directories at " << config_dir << std::endl;
+            return EXIT_FAILURE;
+        }
+        // prompt for nickname and generate identity
+        std::string nick;
+        std::cout << "Welcome to XORchat! Let's get you logged in." << std::endl;
+        std::cout << "Enter your nickname: ";
+        std::getline(std::cin, nick);
+        // if no nickname, you get a timestamp username. sucks for you
+        if (nick.empty()) nick = std::string("user_") + std::to_string(std::time(nullptr));
+
+        
+        // Build an identity prefix path inside ident_dir, filename safe
+        std::string safe_nick = nick;
+        for (auto &c: safe_nick) if (!isalnum((unsigned char)c)) c = '_';
+        std::string identity_prefix = ident_dir + "/" + safe_nick;
+
+        // Save minimal conf so next run reuses
+        std::map<std::string,std::string> cfg;
+        cfg["nick"] = nick;
+        cfg["identity_prefix"] = identity_prefix;
+        save_simple_conf(conf_file, cfg);
+
+        // Make sure params instruct generation+save
+        params.generate_identity = true;
+        params.save_identity = identity_prefix;
+
+    } else {
+
+        // config exists: load conf and ensure identity_prefix is present
+        auto cfg = load_simple_conf(conf_file);
+        if (cfg.find("identity_prefix") != cfg.end()) {
+            params.save_identity = cfg["identity_prefix"];
+        } else {
+            if (cfg.find("nick") == cfg.end()) {
+                std::string nick;
+                std::cout << "Enter your nickname: ";
+                std::getline(std::cin, nick);
+                if (nick.empty()) nick = std::string("user_") + std::to_string(std::time(nullptr));
+                cfg["nick"] = nick;
+                save_simple_conf(conf_file, cfg);
+            }
+        }       
+    }
+
     DhtRunner dht;
     try {
         params.generate_identity = true;
@@ -69,6 +189,16 @@ main(int argc, char **argv)
 
         if (not params.bootstrap.empty())
             dht.bootstrap(params.bootstrap);
+
+        // load nickname
+        std::string nick;
+        auto cfg = load_simple_conf(conf_file);
+        if (cfg.find("nick") != cfg.end())
+            nick = cfg["nick"];
+        else
+            nick = "xorchatter";
+
+        std::cout << "Welcome, " << nick << "!";
 
         print_node_info(dht.getNodeInfo());
         std::cout << "  type 'c {hash}' to join a channel" << std::endl << std::endl;
@@ -132,9 +262,12 @@ main(int argc, char **argv)
                         if (not ok)
                             std::cout << "Message publishing failed !" << std::endl;
                     });
-                } else {
+                } else if (op == "/") {
+                    std::cout << "we'll make this work eventually lol" << std::endl;
+                } else {         
+
                     dht.putSigned(room, dht::ImMessage(rand_id(rd), std::move(line), now), [](bool ok) {
-                        //dht.cancelPut(room, id);
+                        
                         if (not ok)
                             std::cout << "Message publishing failed !" << std::endl;
                     });
