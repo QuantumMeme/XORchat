@@ -198,10 +198,10 @@ main(int argc, char **argv)
         else
             nick = "xorchatter";
 
-        std::cout << "Welcome, " << nick << "!";
+        std::cout << "Welcome, " << nick << "!" << std::endl;
 
         print_node_info(dht.getNodeInfo());
-        std::cout << "  type 'c {hash}' to join a channel" << std::endl << std::endl;
+        std::cout << "  type '/c {hash}' to join a channel" << std::endl << std::endl;
 
         bool connected {false};
         InfoHash room;
@@ -214,6 +214,7 @@ main(int argc, char **argv)
         using_history();
 #endif
 
+        // chat loop
         while (true)
         {
             // using the GNU Readline API
@@ -224,54 +225,61 @@ main(int argc, char **argv)
                 continue;
 
             std::istringstream iss(line);
-            std::string op, idstr;
+            std::string op, cmd, idstr;
             iss >> op;
-            if (not connected) {
-                if (op  == "x" || op == "q" || op == "exit" || op == "quit")
-                    break;
-                else if (op == "c") {
-                    iss >> idstr;
-                    room = InfoHash(idstr);
-                    if (not room) {
-                        room = InfoHash::get(idstr);
-                        std::cout << "Joining h(" << idstr << ") = " << room << std::endl;
+
+            if (op.std::string::find('/') != std::string::npos) {
+                cmd = op.substr(1);
+                if (!connected) {
+                    if (cmd  == "x" || cmd == "q")
+                        break;
+                    else if (cmd == "c") {
+                        iss >> idstr;
+                        room = InfoHash(idstr);
+                        if (not room) {
+                            room = InfoHash::get(idstr);
+                            std::cout << "Joining h(" << idstr << ") = " << room << std::endl;
+                        }
+
+                        token = dht.listen<dht::ImMessage>(room, [&](dht::ImMessage&& msg) {
+                            if (msg.from != myid)
+                                std::cout << msg.from.toString() << " at " << printTime(msg.date)
+                                        << " (took " << print_duration(std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(msg.date))
+                                        << ") " << (msg.to == myid ? "ENCRYPTED ":"") << ": " << msg.id << " - " << msg.msg << std::endl;
+                            return true;
+                        });
+                        connected = true;
+                    } else {
+                        std::cout << "Unknown command. Type '/c {hash}' to join a channel" << std::endl << std::endl;
                     }
-
-                    token = dht.listen<dht::ImMessage>(room, [&](dht::ImMessage&& msg) {
-                        if (msg.from != myid)
-                            std::cout << msg.from.toString() << " at " << printTime(msg.date)
-                                      << " (took " << print_duration(std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(msg.date))
-                                      << ") " << (msg.to == myid ? "ENCRYPTED ":"") << ": " << msg.id << " - " << msg.msg << std::endl;
-                        return true;
-                    });
-                    connected = true;
                 } else {
-                    std::cout << "Unknown command. Type 'c {hash}' to join a channel" << std::endl << std::endl;
-                }
-            } else {
-                auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                if (op == "d") {
-                    dht.cancelListen(room, std::move(token));
-                    connected = false;
-                    continue;
-                } else if (op == "e") {
-                    iss >> idstr;
-                    std::getline(iss, line);
-                    dht.putEncrypted(room, InfoHash(idstr), dht::ImMessage(rand_id(rd), std::move(line), now), [](bool ok) {
-                        //dht.cancelPut(room, id);
-                        if (not ok)
-                            std::cout << "Message publishing failed !" << std::endl;
-                    });
-                } else if (op == "/") {
-                    std::cout << "we'll make this work eventually lol" << std::endl;
-                } else {         
-
-                    dht.putSigned(room, dht::ImMessage(rand_id(rd), std::move(line), now), [](bool ok) {
-                        
-                        if (not ok)
-                            std::cout << "Message publishing failed !" << std::endl;
-                    });
-                }
+                    auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                    if (cmd == "d") {
+                        std::cout << "Disconnecting from channel." << std::endl;
+                        dht.cancelListen(room, std::move(token));
+                        connected = false;
+                        continue;
+                    } else if (cmd == "e") {
+                        iss >> idstr;
+                        std::getline(iss, line);
+                        dht.putEncrypted(room, InfoHash(idstr), dht::ImMessage(rand_id(rd), std::move(line), now), [](bool ok) {
+                            //dht.cancelPut(room, id);
+                            if (not ok)
+                                std::cout << "Message publishing failed !" << std::endl;
+                        });
+                    }
+                }            
+            } else {         
+                    if (connected) {
+                        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                        dht.putSigned(room, dht::ImMessage(rand_id(rd), std::move(line), now), [](bool ok) {
+                            
+                            if (not ok)
+                                std::cout << "Message publishing failed !" << std::endl;
+                        });
+                    } else {
+                        std::cout << "You're not connected." << std::endl;
+                    }
             }
         }
     } catch(const std::exception&e) {
