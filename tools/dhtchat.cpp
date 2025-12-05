@@ -37,11 +37,17 @@ extern "C" {
 #include <mutex>
 #include <utility>
 #include <iostream>
+#include <cctype>
+#include <future>
 
 using namespace dht;
 
 static std::mt19937_64 rd {dht::crypto::getSeededRandomEngine<std::mt19937_64>()};
 static std::uniform_int_distribution<dht::Value::Id> rand_id;
+
+
+// for simplicity's sake. All users on one list :)
+const static InfoHash USER_LIST_KEY = InfoHash::get("userlist");
 
 const std::string printTime(const std::time_t& now) {
     struct tm tstruct = *localtime(&now);
@@ -89,7 +95,7 @@ static void save_simple_conf(const std::string& confpath, const std::map<std::st
     of.close();
 }
 
-
+// this took a dumb amount of time
 static std::map<std::string,std::string> load_simple_conf(const std::string& confpath)
 {
     std::map<std::string,std::string> out;
@@ -107,7 +113,179 @@ static std::map<std::string,std::string> load_simple_conf(const std::string& con
     return out;
 }
 
-void print_usage() {
+/* STARTING IDENTITY STUFF */
+
+
+enum class UserStatus : uint8_t
+{
+    Offline = 0,
+    Online = 1,
+    Away = 2,
+    Busy = 3
+};
+
+struct UserInfo
+{
+    std::string nickname {};
+    std::string pubkey {};
+    UserStatus status {UserStatus::Offline};
+    std::string channel {};
+};
+
+
+// jsons are actually super complicated for no reason so we'll do this 
+static std::string serialize_user_list(const std::map<std::string, UserInfo>& users)
+{
+    std::ostringstream oss;
+    for (const auto& [name, user] : users) {
+        // name | key | status | channel
+        oss << name << '|' << user.pubkey << '|' << static_cast<unsigned>(user.status) << '|' << user.channel << "\n";
+    }
+    return oss.str();
+}
+
+
+static std::map<std::string, UserInfo> parse_user_list(const std::string& serialized)
+{
+    std::map<std::string, UserInfo> result;
+    std::istringstream iss(serialized);
+    std::string line;
+
+    while (std::getline(iss, line))
+    {
+        if (line.empty())
+            continue;
+
+        std::istringstream line_stream(line);
+        std::string nickname, pubkey, status_str, channel;
+
+        if (std::getline(line_stream, nickname, '|')
+            && std::getline(line_stream, pubkey, '|')
+            && std::getline(line_stream, status_str, '|')
+            && std::getline(line_stream, channel))
+        {
+            try {
+                auto status_val = static_cast<uint8_t>(std::stoul(status_str));
+                UserInfo ident {nickname, pubkey, static_cast<UserStatus>(status_val), channel};
+                result[nickname] = std::move(ident);
+            } catch (const std::exception&){ continue; }
+        }
+    }
+    return result;
+}
+
+
+class DhtIdentity {
+    public:
+        DhtIdentity(dht::DhtRunner& dht, std::string nickname, std::string pubkey)
+            : dht_(dht), nickname_(std::move(nickname)), pubkey_(std::move(pubkey)),
+            user_list_key_(USER_LIST_KEY)
+        {
+            refresh_from_dht();
+            set_status(UserStatus::Online);
+        }
+
+        void set_status(UserStatus status)
+        {
+            update_entry([status](UserInfo& entry) { entry.status = status; });
+        }
+
+        void mark_offline()
+        {
+            set_status(UserStatus::Offline);
+        }
+
+        void set_channel(const std::string& channel)
+        {
+            update_entry([&channel](UserInfo& entry) { entry.channel = channel; });
+        }
+
+
+    private:
+        void refresh_from_dht()
+        {
+            auto promise = std::make_shared<std::promise<std::map<std::string, UserInfo>>>();
+            auto future = promise->get_future();
+
+            dht_.get(user_list_key_, [promise](const std::vector<std::shared_ptr<dht::Value>>& values) {
+                std::map<std::string, UserInfo> aggregated;
+                for (const auto& value : values) {
+                    std::string content(value->data.begin(), value->data.end());
+                    auto parsed = parse_user_list(content);
+                    for (auto& [name, user] : parsed) {
+                        aggregated[name] = std::move(user);
+                    }
+                }
+                try {
+                    promise->set_value(std::move(aggregated));
+                } catch (...) {
+                }
+                return false;
+            }, [promise](bool ok) {
+                if (!ok) {
+                    try {
+                        promise->set_value({});
+                    } catch (...) {
+                    }
+                }
+            });
+
+            if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                user_list_ = future.get();
+            }
+        }
+
+        void ensure_pubkey_unique()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [name, user] : user_list_) {
+                if (user.pubkey == pubkey_ && name != nickname_) {
+                    throw std::runtime_error("Public key already registered for another user");
+                }
+            }
+        }
+
+        template<typename Fn>
+        void update_entry(Fn updater)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [name, user] : user_list_) {
+                if (user.pubkey == pubkey_ && name != nickname_) {
+                    throw std::runtime_error("Public key already registered for another user");
+                }
+            }
+            auto& entry = user_list_[nickname_];
+            entry.nickname = nickname_;
+            entry.pubkey = pubkey_;
+            updater(entry);
+            publish_locked();
+        }
+
+        void publish_locked()
+        {
+            auto payload = serialize_user_list(user_list_);
+            //std::cout << payload << std::endl;
+            dht::Value value(payload);
+            value.id = user_list_value_id_;
+            dht_.putSigned(user_list_key_, std::move(value), [](bool ok) {
+                if (!ok)
+                    std::cerr << "Failed to publish user list to DHT" << std::endl;
+            });
+        }
+
+        dht::DhtRunner& dht_;
+        std::string nickname_ {};
+        std::string pubkey_ {};
+        dht::InfoHash user_list_key_;
+        dht::Value::Id user_list_value_id_ {};
+        std::map<std::string, UserInfo> user_list_;
+        std::mutex mutex_;
+};
+
+
+
+static void print_usage() {
     std::cout << "Usage: dhtchat [-n network_id] [-p local_port] [-b bootstrap_host[:port]]" << std::endl << std::endl;
     std::cout << "dhtchat, a simple OpenDHT command line chat client." << std::endl;
     std::cout << "Report bugs to: https://opendht.net" << std::endl;
@@ -132,6 +310,7 @@ main(int argc, char **argv)
     std::string config_dir = get_default_config_dir();
     std::string ident_dir = config_dir + "/ident";
     std::string conf_file = config_dir + "/xorchat.conf";
+    std::string identity_prefix;
 
     if (!file_exists(config_dir) || !file_exists(ident_dir)) {
     // create structure and create initial config
@@ -148,18 +327,17 @@ main(int argc, char **argv)
         if (nick.empty()) nick = std::string("user_") + std::to_string(std::time(nullptr));
 
         
-        // Build an identity prefix path inside ident_dir, filename safe
+        // file prefix
         std::string safe_nick = nick;
         for (auto &c: safe_nick) if (!isalnum((unsigned char)c)) c = '_';
-        std::string identity_prefix = ident_dir + "/" + safe_nick;
+        identity_prefix = ident_dir + "/" + safe_nick;
 
-        // Save minimal conf so next run reuses
+        // save minimal conf for next run
         std::map<std::string,std::string> cfg;
         cfg["nick"] = nick;
         cfg["identity_prefix"] = identity_prefix;
         save_simple_conf(conf_file, cfg);
 
-        // Make sure params instruct generation+save
         params.generate_identity = true;
         params.save_identity = identity_prefix;
 
@@ -178,13 +356,23 @@ main(int argc, char **argv)
                 cfg["nick"] = nick;
                 save_simple_conf(conf_file, cfg);
             }
-        }       
+        }   
+
+        identity_prefix = cfg["identity_prefix"];
+        // std::cout << identity_prefix << std::endl;
     }
 
     DhtRunner dht;
     try {
-        params.generate_identity = true;
+        //params.generate_identity = true;
+
+        //std::string ident_file = identity_prefix;
+
+        crypto::Identity ident = crypto::loadIdentity(identity_prefix);
+        params.id = ident;
+
         auto dhtConf = getDhtConfig(params);
+
         dht.run(params.port, dhtConf.first, std::move(dhtConf.second));
 
         if (not params.bootstrap.empty())
@@ -199,6 +387,8 @@ main(int argc, char **argv)
             nick = "xorchatter";
 
         std::cout << "Welcome, " << nick << "!" << std::endl;
+
+        DhtIdentity identity_manager(dht, nick, dht.getId().toString());
 
         print_node_info(dht.getNodeInfo());
         std::cout << "  type '/c {hash}' to join a channel" << std::endl << std::endl;
@@ -226,13 +416,18 @@ main(int argc, char **argv)
 
             std::istringstream iss(line);
             std::string op, cmd, idstr;
+            std::uint8_t stat;
             iss >> op;
 
             if (op.std::string::find('/') != std::string::npos) {
                 cmd = op.substr(1);
                 if (!connected) {
+
+                    // quitting while disconnected
                     if (cmd  == "x" || cmd == "q")
                         break;
+                        
+                    // joining channels
                     else if (cmd == "c") {
                         iss >> idstr;
                         room = InfoHash(idstr);
@@ -241,8 +436,12 @@ main(int argc, char **argv)
                             std::cout << "Joining h(" << idstr << ") = " << room << std::endl;
                         }
 
+                        identity_manager.set_channel(room.toString());
+                        identity_manager.set_status(UserStatus::Online);
+
                         token = dht.listen<dht::ImMessage>(room, [&](dht::ImMessage&& msg) {
                             if (msg.from != myid)
+                                // prints message
                                 std::cout << msg.from.toString() << " at " << printTime(msg.date)
                                         << " (took " << print_duration(std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(msg.date))
                                         << ") " << (msg.to == myid ? "ENCRYPTED ":"") << ": " << msg.id << " - " << msg.msg << std::endl;
@@ -258,6 +457,8 @@ main(int argc, char **argv)
                         std::cout << "Disconnecting from channel." << std::endl;
                         dht.cancelListen(room, std::move(token));
                         connected = false;
+                        identity_manager.set_channel("");
+                        identity_manager.mark_offline();
                         continue;
                     } else if (cmd == "e") {
                         iss >> idstr;
@@ -267,6 +468,22 @@ main(int argc, char **argv)
                             if (not ok)
                                 std::cout << "Message publishing failed !" << std::endl;
                         });
+                    } else if (cmd == "s") { 
+                        iss >> idstr;
+                        try
+                        {
+                            stat = std::stoi(cmd);
+                            if (stat > 0 && stat <= 3)
+                                identity_manager.set_status(static_cast<UserStatus>(stat));
+                            else
+                                std::cout << cmd << " is not a valid status." << std::endl;
+                        }
+                        catch(const std::exception& e)
+                        {
+                            std::cerr << e.what() << '\n';
+                            continue;
+                        }
+                        
                     }
                 }            
             } else {         
@@ -282,6 +499,7 @@ main(int argc, char **argv)
                     }
             }
         }
+        identity_manager.mark_offline();
     } catch(const std::exception&e) {
         std::cerr << std::endl <<  e.what() << std::endl;
     }
