@@ -174,6 +174,17 @@ static std::map<std::string, UserInfo> parse_user_list(const std::string& serial
     return result;
 }
 
+static std::string announcement(std::string usernick, bool joined)
+{
+    std::string msg = "";
+    if (joined)
+        msg = usernick + " has joined.\n";
+    else
+        msg = usernick + " has left.\n";
+
+    return msg;
+}
+
 
 class DhtIdentity {
     public:
@@ -236,15 +247,15 @@ class DhtIdentity {
             }
         }
 
-        void ensure_pubkey_unique()
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [name, user] : user_list_) {
-                if (user.pubkey == pubkey_ && name != nickname_) {
-                    throw std::runtime_error("Public key already registered for another user");
-                }
-            }
-        }
+        // void ensure_pubkey_unique()
+        // {
+        //     std::lock_guard<std::mutex> lock(mutex_);
+        //     for (const auto& [name, user] : user_list_) {
+        //         if (user.pubkey == pubkey_ && name != nickname_) {
+        //             throw std::runtime_error("Public key already registered for another user");
+        //         }
+        //     }
+        // }
 
         template<typename Fn>
         void update_entry(Fn updater)
@@ -312,6 +323,8 @@ main(int argc, char **argv)
     std::string conf_file = config_dir + "/xorchat.conf";
     std::string identity_prefix;
 
+    bool has_config = false;
+
     if (!file_exists(config_dir) || !file_exists(ident_dir)) {
     // create structure and create initial config
         if (!dir_exists(ident_dir)) {
@@ -342,10 +355,11 @@ main(int argc, char **argv)
         params.save_identity = identity_prefix;
 
     } else {
-
+        
         // config exists: load conf and ensure identity_prefix is present
         auto cfg = load_simple_conf(conf_file);
         if (cfg.find("identity_prefix") != cfg.end()) {
+            has_config = true;
             params.save_identity = cfg["identity_prefix"];
         } else {
             if (cfg.find("nick") == cfg.end()) {
@@ -368,8 +382,11 @@ main(int argc, char **argv)
 
         //std::string ident_file = identity_prefix;
 
-        crypto::Identity ident = crypto::loadIdentity(identity_prefix);
-        params.id = ident;
+        if (has_config)
+        {
+            crypto::Identity ident = crypto::loadIdentity(identity_prefix);
+            params.id = ident;
+        }
 
         auto dhtConf = getDhtConfig(params);
 
@@ -436,18 +453,27 @@ main(int argc, char **argv)
                             std::cout << "Joining h(" << idstr << ") = " << room << std::endl;
                         }
 
+                        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+
+
                         identity_manager.set_channel(room.toString());
                         identity_manager.set_status(UserStatus::Online);
 
                         token = dht.listen<dht::ImMessage>(room, [&](dht::ImMessage&& msg) {
                             if (msg.from != myid)
-                                // prints message
                                 std::cout << msg.from.toString() << " at " << printTime(msg.date)
                                         << " (took " << print_duration(std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(msg.date))
                                         << ") " << (msg.to == myid ? "ENCRYPTED ":"") << ": " << msg.id << " - " << msg.msg << std::endl;
                             return true;
                         });
+
                         connected = true;
+                        
+                        dht.putSigned(room, dht::ImMessage(rand_id(rd), std::move(announcement(nick, true)), now), [](bool ok) {
+                            if (not ok)
+                                std::cout << "Message publishing failed !" << std::endl;
+                        });
+
                     } else {
                         std::cout << "Unknown command. Type '/c {hash}' to join a channel" << std::endl << std::endl;
                     }
@@ -455,6 +481,10 @@ main(int argc, char **argv)
                     auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                     if (cmd == "d") {
                         std::cout << "Disconnecting from channel." << std::endl;
+                        dht.putSigned(room, dht::ImMessage(rand_id(rd), std::move(announcement(nick, false)), now), [](bool ok) {
+                            if (not ok)
+                                std::cout << "Message publishing failed !" << std::endl;
+                        });
                         dht.cancelListen(room, std::move(token));
                         connected = false;
                         identity_manager.set_channel("");
