@@ -39,6 +39,8 @@ extern "C" {
 #include <iostream>
 #include <cctype>
 #include <future>
+#include <chrono>
+#include <condition_variable>
 
 using namespace dht;
 
@@ -130,17 +132,17 @@ struct UserInfo
     std::string pubkey {};
     UserStatus status {UserStatus::Offline};
     std::string channel {};
+    std::time_t last_seen {0}; // heartbeat timestamp (unix epoch)
 };
 
 
 // jsons are actually super complicated for no reason so we'll do this 
-static std::string serialize_user_list(const std::map<std::string, UserInfo>& users)
+// Format per line: name|pubkey|status|channel|last_seen\n
+
+static std::string serialize_user_list(const UserInfo& user)
 {
     std::ostringstream oss;
-    for (const auto& [name, user] : users) {
-        // name | key | status | channel
-        oss << name << '|' << user.pubkey << '|' << static_cast<unsigned>(user.status) << '|' << user.channel << "\n";
-    }
+    oss << user.nickname << '|' << user.pubkey << '|' << static_cast<unsigned>(user.status) << '|' << user.channel << '|' << user.last_seen << "\n";
     return oss.str();
 }
 
@@ -157,19 +159,22 @@ static std::map<std::string, UserInfo> parse_user_list(const std::string& serial
             continue;
 
         std::istringstream line_stream(line);
-        std::string nickname, pubkey, status_str, channel;
+        std::string nickname, pubkey, status_str, channel, last_seen_str;
 
         if (std::getline(line_stream, nickname, '|')
             && std::getline(line_stream, pubkey, '|')
             && std::getline(line_stream, status_str, '|')
-            && std::getline(line_stream, channel))
+            && std::getline(line_stream, channel, '|')
+            && std::getline(line_stream, last_seen_str))
         {
             try {
                 auto status_val = static_cast<uint8_t>(std::stoul(status_str));
-                UserInfo ident {nickname, pubkey, static_cast<UserStatus>(status_val), channel};
+                std::time_t last_seen = 0;
+                try { last_seen = static_cast<std::time_t>(std::stoll(last_seen_str)); } catch(...) { last_seen = 0; }
+                UserInfo ident {nickname, pubkey, static_cast<UserStatus>(status_val), channel, last_seen};
                 result[nickname] = std::move(ident);
             } catch (const std::exception&){ continue; }
-        }
+        }    
     }
     return result;
 }
@@ -192,13 +197,35 @@ class DhtIdentity {
             : dht_(dht), nickname_(std::move(nickname)), pubkey_(std::move(pubkey)),
             user_list_key_(USER_LIST_KEY)
         {
+            // make id separate to pubkey
+            user_list_value_id_ = static_cast<dht::Value::Id>(std::hash<std::string>{}(pubkey_));
+
             refresh_from_dht();
-            set_status(UserStatus::Online);
+            set_status(UserStatus::Offline);
+
+            // start heartbeat thread
+            heartbeat_interval_seconds_ = 30;
+
+            heartbeat_stop_.store(false);
+            heartbeat_thread_ = std::thread([this]() {
+                this->heartbeat_loop();
+            });
+        }
+
+        ~DhtIdentity() {
+            heartbeat_stop_.store(true);
+            heartbeat_cv_.notify_all();
+            if (heartbeat_thread_.joinable())
+                heartbeat_thread_.join();
+            // mark offline on destruction/pid exit
+            try {
+                mark_offline();
+            } catch(...) {}
         }
 
         void set_status(UserStatus status)
         {
-            update_entry([status](UserInfo& entry) { entry.status = status; });
+            update_entry([status](UserInfo& entry) { entry.status = status; }, false);
         }
 
         void mark_offline()
@@ -208,36 +235,41 @@ class DhtIdentity {
 
         void set_channel(const std::string& channel)
         {
-            update_entry([&channel](UserInfo& entry) { entry.channel = channel; });
+            update_entry([&channel](UserInfo& entry) { entry.channel = channel; }, false);
         }
 
 
     private:
         void refresh_from_dht()
         {
+            // https://en.cppreference.com/w/cpp/memory/shared_ptr/make_shared.html
+            // thank the Lord for auto typing.
             auto promise = std::make_shared<std::promise<std::map<std::string, UserInfo>>>();
             auto future = promise->get_future();
 
-            dht_.get(user_list_key_, [promise](const std::vector<std::shared_ptr<dht::Value>>& values) {
+            dht_.get(user_list_key_, [promise](const std::vector<std::shared_ptr<dht::Value>>& values)
+            {
                 std::map<std::string, UserInfo> aggregated;
                 for (const auto& value : values) {
                     std::string content(value->data.begin(), value->data.end());
                     auto parsed = parse_user_list(content);
                     for (auto& [name, user] : parsed) {
-                        aggregated[name] = std::move(user);
+                        // prefer the most recent last_seen
+                        auto it = aggregated.find(name);
+                        if (it == aggregated.end() || user.last_seen > it->second.last_seen) {
+                            aggregated[name] = std::move(user);
+                        }
                     }
                 }
                 try {
                     promise->set_value(std::move(aggregated));
-                } catch (...) {
-                }
+                } catch (...) {}
                 return false;
             }, [promise](bool ok) {
                 if (!ok) {
                     try {
                         promise->set_value({});
-                    } catch (...) {
-                    }
+                    } catch (...) {}
                 }
             });
 
@@ -258,7 +290,7 @@ class DhtIdentity {
         // }
 
         template<typename Fn>
-        void update_entry(Fn updater)
+        void update_entry(Fn updater, bool immediate)
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto& [name, user] : user_list_) {
@@ -270,19 +302,41 @@ class DhtIdentity {
             entry.nickname = nickname_;
             entry.pubkey = pubkey_;
             updater(entry);
-            publish_locked();
+
+            // always update last_seen when we modify the entry
+            entry.last_seen = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            if (immediate)
+                publish_locked();
         }
 
         void publish_locked()
         {
-            auto payload = serialize_user_list(user_list_);
-            //std::cout << payload << std::endl;
+            auto it = user_list_.find(nickname_); // ensures entry is ours
+            if (it == user_list_.end()) return;
+            auto payload = serialize_user_list(it->second);
             dht::Value value(payload);
             value.id = user_list_value_id_;
             dht_.putSigned(user_list_key_, std::move(value), [](bool ok) {
                 if (!ok)
-                    std::cerr << "Failed to publish user list to DHT" << std::endl;
+                    std::cerr << "Failed to publish user entry to DHT" << std::endl;
             });
+        }
+
+        void heartbeat_loop()
+        {
+            std::unique_lock<std::mutex> lk(heartbeat_mutex_);
+            while (!heartbeat_stop_.load())
+            {
+                // update only our own entry's last_seen
+                try {
+                    update_entry([](UserInfo& entry){ /* no-op for other fields */ }, true);
+                } catch (const std::exception& e) {
+                    std::cerr << "Heartbeat update failed: " << e.what() << std::endl;
+                }
+                // wait for interval or stop
+                heartbeat_cv_.wait_for(lk, std::chrono::seconds(heartbeat_interval_seconds_), [this](){ return heartbeat_stop_.load(); });
+                if (heartbeat_stop_.load()) break;
+            }
         }
 
         dht::DhtRunner& dht_;
@@ -292,6 +346,13 @@ class DhtIdentity {
         dht::Value::Id user_list_value_id_ {};
         std::map<std::string, UserInfo> user_list_;
         std::mutex mutex_;
+
+        // heartbeat control
+        std::thread heartbeat_thread_;
+        std::atomic_bool heartbeat_stop_{false};
+        std::mutex heartbeat_mutex_;
+        std::condition_variable heartbeat_cv_;
+        unsigned long heartbeat_interval_seconds_ {30};
 };
 
 
