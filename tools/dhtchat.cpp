@@ -240,7 +240,7 @@ static bool userlist_to_file(const std::unordered_map<std::string, UserInfo>& us
     for (const auto& kv : users) {
         const auto& pubkey = kv.first;
         const auto& info = kv.second;
-        ofs << pubkey << '|' << info.nickname << '|' << static_cast<unsigned>(info.status) << '|' << info.channel << '|' << info.last_seen << "\n";
+        ofs << pubkey << '|' << info.nickname.substr(2) << '|' << static_cast<unsigned>(info.status) << '|' << info.channel << '|' << info.last_seen << "\n";
     }
     ofs.close();
 
@@ -367,7 +367,7 @@ class DhtIdentity {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto& [name, user] : user_list_) {
-                if (user.pubkey == pubkey_ && name != nickname_ && user.status!= 0) {
+                if (user.pubkey == pubkey_ && name != nickname_ && user.status != UserStatus::Offline) {
                     throw std::runtime_error("Public key already registered for another user");
                 }
             }
