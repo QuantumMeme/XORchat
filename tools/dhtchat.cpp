@@ -54,17 +54,16 @@ const static InfoHash USER_LIST_KEY = InfoHash::get("userlist");
 
 void print_help() {
     std::cout << "XORchat command line interface (CLI)" << std::endl;
-    std::cout << "Possible commands:" << std::endl
-              << "  /h    Print this help message." << std::endl
-              << "  /q, /x    Quit the program when not in a channel." << std::endl
-              << "  /c    Connect to channel" << std::endl;
-              << "  /d    Disconnect from channel" << std::endl;
-              << "  /l    Save the user list" << std::endl;
-              << "  /e [pkey] [msg] Whisper to user with public key" << std::endl;
-              << "  /s [0=Offline,1=Online,2=Away,3=Busy] Set status" << std::endl;
-
-
+    std::cout << "Possible commands:" << std::endl;
+    std::cout << "  /h                Print this help message." << std::endl;
+    std::cout << "  /q, /x            Quit the program when not in a channel." << std::endl;
+    std::cout << "  /c                Connect to channel." << std::endl;
+    std::cout << "  /d                Disconnect from channel." << std::endl;
+    std::cout << "  /l                Save the user list." << std::endl;
+    std::cout << "  /e [pkey] [msg]   Whisper to user with public key." << std::endl;
+    std::cout << "  /s [0-3]          Set status (0=Offline, 1=Online, 2=Away, 3=Busy)." << std::endl;
 }
+
 const std::string printTime(const std::time_t& now) {
     struct tm tstruct = *localtime(&now);
     char buf[80];
@@ -608,9 +607,10 @@ main(int argc, char **argv)
 
                         token = dht.listen<dht::ImMessage>(room, [&](dht::ImMessage&& msg) {
                             if (msg.from != myid)
-                                std::cout << msg.from.toString() << " at " << printTime(msg.date)
-                                        << " (took " << print_duration(std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(msg.date))
-                                        << ") " << (msg.to == myid ? "ENCRYPTED ":"") << ": " << msg.id << " - " << msg.msg << std::endl;
+                            auto from_pkey = msg.from.toString();
+                                std::cout << msg.from.toString() << " at " << printTime(msg.date);
+                                std::cout << " (took " << print_duration(std::chrono::system_clock::now() - std::chrono::system_clock::from_time_t(msg.date));
+                                std::cout << ") " << (msg.to == myid ? "ENCRYPTED ":"") << " - " << msg.msg << std::endl;
                             return true;
                         });
 
@@ -665,6 +665,12 @@ main(int argc, char **argv)
                         std::cout << "Saving userlist." << std::endl;
                         std::unordered_map<std::string, UserInfo> list = pull_userlist(dht);
                         userlist_to_file(list, get_default_config_dir() + "/users.txt");
+                        
+                        for (const auto& kv : list) { // This half could be its own function or command
+                            const auto& pubkey = kv.first;
+                            const auto& info = kv.second;
+                            std::cout << pubkey << '|' << info.nickname.substr(2) << '|' << static_cast<unsigned>(info.status) << '|' << info.channel << "\n"; 
+                        }
                     }
                 }            
             } else {         
