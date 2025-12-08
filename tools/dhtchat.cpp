@@ -41,6 +41,7 @@ extern "C" {
 #include <future>
 #include <chrono>
 #include <condition_variable>
+#include <unordered_map>
 
 using namespace dht;
 
@@ -100,7 +101,7 @@ static void save_simple_conf(const std::string& confpath, const std::map<std::st
 // this took a dumb amount of time
 static std::map<std::string,std::string> load_simple_conf(const std::string& confpath)
 {
-    std::map<std::string,std::string> out;
+    std::map<std::string, std::string> out;
     std::ifstream ifs(confpath);
     if (!ifs) return out;
     std::string line;
@@ -179,6 +180,65 @@ static std::map<std::string, UserInfo> parse_user_list(const std::string& serial
     return result;
 }
 
+
+static std::unordered_map<std::string, UserInfo> pull_userlist(dht::DhtRunner& dht, const InfoHash& key = USER_LIST_KEY)
+{
+    auto promise = std::make_shared<std::promise<std::unordered_map<std::string, UserInfo>>>();
+    auto future = promise->get_future();
+
+    dht.get(key, [promise](const std::vector<std::shared_ptr<dht::Value>>& values) {
+        std::unordered_map<std::string, UserInfo> aggregated;
+        for (const auto& value : values) {
+            std::string content(value->data.begin(), value->data.end());
+            auto parsed = parse_user_list(content);
+            for (auto& [name, user] : parsed) {
+                if (user.pubkey.empty())
+                    continue;
+                auto iter = aggregated.find(user.pubkey);
+                if (iter == aggregated.end() || user.last_seen > iter->second.last_seen) {
+                    aggregated[user.pubkey] = std::move(user);
+                }
+            }
+        }
+        try {
+            promise->set_value(std::move(aggregated));
+        } catch (...) {}
+        return false;
+    }, [promise](bool ok) {
+        if (not ok) {
+            try { promise->set_value({}); } catch(...) {}
+        }
+    });
+
+    if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+        try {
+            return future.get();
+        } catch(...) {
+            return {};
+        }
+    }
+    return {};
+}
+
+static bool userlist_to_file(const std::unordered_map<std::string, UserInfo>& users, const std::string& path)
+{
+    std::ofstream ofs(path, std::ios::trunc);
+
+    if (!ofs) {
+        std::cerr << path << " not found" << std::endl;
+        return false;
+    }
+
+    for (const auto& kv : users) {
+        const auto& pubkey = kv.first;
+        const auto& info = kv.second;
+        ofs << pubkey << '|' << info.nickname << '|' << static_cast<unsigned>(info.status) << '|' << info.channel << '|' << info.last_seen << "\n";
+    }
+    ofs.close();
+
+    return true;
+}
+
 static std::string announcement(std::string usernick, bool joined)
 {
     std::string msg = "";
@@ -204,7 +264,7 @@ class DhtIdentity {
             set_status(UserStatus::Offline);
 
             // start heartbeat thread
-            heartbeat_interval_seconds_ = 30;
+            heartbeat_interval_seconds_ = 5;
 
             heartbeat_stop_.store(false);
             heartbeat_thread_ = std::thread([this]() {
@@ -352,7 +412,7 @@ class DhtIdentity {
         std::atomic_bool heartbeat_stop_{false};
         std::mutex heartbeat_mutex_;
         std::condition_variable heartbeat_cv_;
-        unsigned long heartbeat_interval_seconds_ {30};
+        unsigned long heartbeat_interval_seconds_ {5};
 };
 
 
@@ -575,6 +635,10 @@ main(int argc, char **argv)
                             continue;
                         }
                         
+                    } else if (cmd == "l") {
+                        std::cout << "Saving userlist." << std::endl;
+                        std::unordered_map<std::string, UserInfo> list = pull_userlist(dht);
+                        userlist_to_file(list, get_default_config_dir() + "/users.txt");
                     }
                 }            
             } else {         
