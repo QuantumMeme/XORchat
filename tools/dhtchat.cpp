@@ -367,7 +367,7 @@ class DhtIdentity {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto& [name, user] : user_list_) {
-                if (user.pubkey == pubkey_ && name != nickname_) {
+                if (user.pubkey == pubkey_ && name != nickname_ && user.status!= 0) {
                     throw std::runtime_error("Public key already registered for another user");
                 }
             }
