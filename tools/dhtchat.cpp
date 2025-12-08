@@ -186,29 +186,37 @@ static std::unordered_map<std::string, UserInfo> pull_userlist(dht::DhtRunner& d
     auto promise = std::make_shared<std::promise<std::unordered_map<std::string, UserInfo>>>();
     auto future = promise->get_future();
 
-    dht.get(key, [promise](const std::vector<std::shared_ptr<dht::Value>>& values) {
-        std::unordered_map<std::string, UserInfo> aggregated;
-        for (const auto& value : values) {
-            std::string content(value->data.begin(), value->data.end());
-            auto parsed = parse_user_list(content);
-            for (auto& [name, user] : parsed) {
-                if (user.pubkey.empty())
-                    continue;
-                auto iter = aggregated.find(user.pubkey);
-                if (iter == aggregated.end() || user.last_seen > iter->second.last_seen) {
-                    aggregated[user.pubkey] = std::move(user);
+    // shared aggregated map filled by the values callback
+    auto aggregated = std::make_shared<std::unordered_map<std::string, UserInfo>>();
+
+    dht.get(key,
+        // values callback: accumulate results and return true to continue receiving batches
+        [aggregated](const std::vector<std::shared_ptr<dht::Value>>& values) {
+            for (const auto& value : values) {
+                std::string content(value->data.begin(), value->data.end());
+                auto parsed = parse_user_list(content);
+                for (auto& [name, user] : parsed) {
+                    if (user.pubkey.empty())
+                        continue;
+                    auto iter = aggregated->find(user.pubkey);
+                    if (iter == aggregated->end() || user.last_seen > iter->second.last_seen) {
+                        (*aggregated)[user.pubkey] = std::move(user);
+                    }
                 }
             }
+            // return true so OpenDHT continues delivering other batches
+            return true;
+        },
+        // done callback: send the final aggregated result once the operation completes
+        [promise, aggregated](bool ok) {
+            try {
+                if (ok)
+                    promise->set_value(std::move(*aggregated));
+                else
+                    promise->set_value({});
+            } catch (...) {}
         }
-        try {
-            promise->set_value(std::move(aggregated));
-        } catch (...) {}
-        return false;
-    }, [promise](bool ok) {
-        if (not ok) {
-            try { promise->set_value({}); } catch(...) {}
-        }
-    });
+    );
 
     if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
         try {
@@ -302,42 +310,47 @@ class DhtIdentity {
     private:
         void refresh_from_dht()
         {
-            // https://en.cppreference.com/w/cpp/memory/shared_ptr/make_shared.html
-            // thank the Lord for auto typing.
             auto promise = std::make_shared<std::promise<std::map<std::string, UserInfo>>>();
             auto future = promise->get_future();
 
-            dht_.get(user_list_key_, [promise](const std::vector<std::shared_ptr<dht::Value>>& values)
-            {
-                std::map<std::string, UserInfo> aggregated;
-                for (const auto& value : values) {
-                    std::string content(value->data.begin(), value->data.end());
-                    auto parsed = parse_user_list(content);
-                    for (auto& [name, user] : parsed) {
-                        // prefer the most recent last_seen
-                        auto it = aggregated.find(name);
-                        if (it == aggregated.end() || user.last_seen > it->second.last_seen) {
-                            aggregated[name] = std::move(user);
+            // shared aggregated map filled by the values callback
+            auto aggregated = std::make_shared<std::map<std::string, UserInfo>>();
+
+            dht_.get(user_list_key_,
+                // values callback: accumulate results and return true to keep receiving
+                [aggregated](const std::vector<std::shared_ptr<dht::Value>>& values) {
+                    for (const auto& value : values) {
+                        std::string content(value->data.begin(), value->data.end());
+                        auto parsed = parse_user_list(content);
+                        for (auto& [name, user] : parsed) {
+                            auto it = aggregated->find(name);
+                            if (it == aggregated->end() || user.last_seen > it->second.last_seen) {
+                                (*aggregated)[name] = std::move(user);
+                            }
                         }
                     }
-                }
-                try {
-                    promise->set_value(std::move(aggregated));
-                } catch (...) {}
-                return false;
-            }, [promise](bool ok) {
-                if (!ok) {
+                    return true;
+                },
+                // done callback: deliver the final aggregated map
+                [promise, aggregated](bool ok) {
                     try {
-                        promise->set_value({});
+                        if (ok)
+                            promise->set_value(std::move(*aggregated));
+                        else
+                            promise->set_value({});
                     } catch (...) {}
                 }
-            });
+            );
 
             if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                user_list_ = future.get();
+                try {
+                    user_list_ = future.get();
+                } catch(...) {
+                    user_list_.clear();
+                }
             }
-        }
+}
 
         // void ensure_pubkey_unique()
         // {
