@@ -52,6 +52,19 @@ static std::uniform_int_distribution<dht::Value::Id> rand_id;
 // for simplicity's sake. All users on one list :)
 const static InfoHash USER_LIST_KEY = InfoHash::get("userlist");
 
+void print_help() {
+    std::cout << "XORchat command line interface (CLI)" << std::endl;
+    std::cout << "Possible commands:" << std::endl
+              << "  /h    Print this help message." << std::endl
+              << "  /q, /x    Quit the program when not in a channel." << std::endl
+              << "  /c    Connect to channel" << std::endl;
+              << "  /d    Disconnect from channel" << std::endl;
+              << "  /l    Save the user list" << std::endl;
+              << "  /e [pkey] [msg] Whisper to user with public key" << std::endl;
+              << "  /s [0=Offline,1=Online,2=Away,3=Busy] Set status" << std::endl;
+
+
+}
 const std::string printTime(const std::time_t& now) {
     struct tm tstruct = *localtime(&now);
     char buf[80];
